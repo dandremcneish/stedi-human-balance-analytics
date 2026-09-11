@@ -9,17 +9,20 @@ and have agreed to share their data for research).
 
 IMPORTANT: The fulfillment website has a defect that reuses the same ~30
 serial numbers across millions of customers, so serialnumber is NOT unique
-in either table. An INNER JOIN on serialNumber will silently multiply rows
-(or, inside Glue's Spark engine specifically, can return zero rows -- see
-the project's Troubleshooting page). The correct approach is a semi-join:
-keep every step_trainer_landing row whose serialNumber also appears
-somewhere in customers_curated, without actually joining/duplicating rows.
-This is written as a "WHERE ... IN (...)" SQL query rather than a visual
-Join node, per the project's troubleshooting guidance.
+in either table. Joining step_trainer_landing directly against
+customers_curated on serialNumber would multiply every step_trainer row by
+however many curated customers happen to share that serial number. To avoid
+that while still using an INNER JOIN (rather than the IN-subquery semi-join
+used previously), this job first builds a small distinct list of serial
+numbers -- SELECT DISTINCT serialnumber FROM customers_curated -- and joins
+step_trainer_landing against that deduplicated list instead of against
+customers_curated directly. Joining to a distinct, one-row-per-serial-number
+list gives the same duplicate-row protection as the semi-join while making
+the join explicit.
 
-Reads    : Glue Catalog tables  stedi.step_trainer_landing, stedi.customers_curated
-Writes   : Glue Catalog table   stedi.step_trainer_trusted
-            (s3://<bucket>/step_trainer/trusted/)
+Reads : Glue Catalog tables stedi.step_trainer_landing, stedi.customers_curated
+Writes : Glue Catalog table stedi.step_trainer_trusted
+(s3://<bucket>/step_trainer/trusted/)
 Expected row count after this job: 14460
 """
 
@@ -44,41 +47,44 @@ GLUE_DATABASE = "stedi"
 
 # --- Read sources from the Data Catalog ---
 step_trainer_landing_dyf = glueContext.create_dynamic_frame.from_catalog(
-    database=GLUE_DATABASE, table_name="step_trainer_landing"
+                database=GLUE_DATABASE, table_name="step_trainer_landing"
 )
 customers_curated_dyf = glueContext.create_dynamic_frame.from_catalog(
-    database=GLUE_DATABASE, table_name="customers_curated"
+                database=GLUE_DATABASE, table_name="customers_curated"
 )
 
 step_trainer_landing_dyf.toDF().createOrReplaceTempView("step_trainer_landing")
 customers_curated_dyf.toDF().createOrReplaceTempView("customers_curated")
 
-# --- Transform: semi-join on serialNumber (deliberately NOT an inner join --
-#     see module docstring above for why) ---
+# --- Transform: INNER JOIN against a DISTINCT list of curated serial
+# numbers (deliberately not a direct join to customers_curated -- see
+# module docstring above for why) ---
 step_trainer_trusted_df = spark.sql(
-    """
-    SELECT s.*
-    FROM step_trainer_landing s
-    WHERE s.serialNumber IN (
-        SELECT serialnumber FROM customers_curated
-    )
-    """
+                """
+                    SELECT s.*
+                        FROM step_trainer_landing s
+                            INNER JOIN (
+                                    SELECT DISTINCT serialnumber
+                                            FROM customers_curated
+                                                ) c
+                                                      ON s.serialNumber = c.serialnumber
+                                                          """
 )
 
 step_trainer_trusted_dyf = DynamicFrame.fromDF(
-    step_trainer_trusted_df, glueContext, "step_trainer_trusted_dyf"
+                step_trainer_trusted_df, glueContext, "step_trainer_trusted_dyf"
 )
 
 # --- Write result to S3 + update the Glue Data Catalog (Trusted Zone) ---
 sink = glueContext.getSink(
-    connection_type="s3",
-    path=f"{S3_BUCKET}/step_trainer/trusted/",
-    enableUpdateCatalog=True,
-    updateBehavior="UPDATE_IN_DATABASE",
+                connection_type="s3",
+                path=f"{S3_BUCKET}/step_trainer/trusted/",
+                enableUpdateCatalog=True,
+                updateBehavior="UPDATE_IN_DATABASE",
 )
 sink.setFormat("glueparquet")
 sink.setCatalogInfo(
-    catalogDatabase=GLUE_DATABASE, catalogTableName="step_trainer_trusted"
+                catalogDatabase=GLUE_DATABASE, catalogTableName="step_trainer_trusted"
 )
 sink.writeFrame(step_trainer_trusted_dyf)
 
