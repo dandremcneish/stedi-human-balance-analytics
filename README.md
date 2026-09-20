@@ -1,9 +1,29 @@
 # STEDI Human Balance Analytics — Data Lakehouse (AWS Glue / Athena / S3)
 
-This is the D609 "Spark and Data Lakes" project: build a lakehouse (Landing →
-Trusted → Curated) for the STEDI Step Trainer sensor data so the Data Science
-team can train a step-detection ML model, while only ever using data from
-customers who consented to research use.
+STEDI is a balance-training device company. Their Step Trainer hardware and companion mobile app generate three raw data streams: customer profile data, mobile accelerometer readings, and Step Trainer sensor readings. This project builds a landing → trusted → curated lakehouse on AWS Glue, Athena, and S3 that turns those three streams into a single privacy-filtered, ML-ready dataset for training a step-detection model, dropping any customer who hasn't consented to share their data before it reaches anything else.
+
+Five Glue ETL jobs move the data through progressively more trustworthy layers, with every stage verified against real row counts pulled live from Athena rather than assumed to have worked.
+
+## Architecture
+
+**Landing** (raw, as-ingested) → **Trusted** (privacy-filtered, deduplicated) → **Curated** (joined, ML-ready)
+
+| Stage | Job | Output | Verified rows |
+|---|---|---|---|
+| Landing | `sql/customer_landing.sql` | `customer_landing` | 956 |
+| Landing | `sql/accelerometer_landing.sql` | `accelerometer_landing` | 81,273 |
+| Landing | `sql/step_trainer_landing.sql` | `step_trainer_landing` | 28,680 |
+| Trusted | `glue_jobs/customer_landing_to_trusted.py` | `customer_trusted` | 482 |
+| Trusted | `glue_jobs/accelerometer_landing_to_trusted.py` | `accelerometer_trusted` | 40,981 |
+| Curated | `glue_jobs/customer_trusted_to_curated.py` | `customers_curated` | 482 |
+| Curated | `glue_jobs/step_trainer_trusted.py` | `step_trainer_trusted` | 14,460 |
+| Curated | `glue_jobs/machine_learning_curated.py` | `machine_learning_curated` | 43,681 |
+
+Screenshots of every count, pulled live from the AWS console, are in `screenshots/`.
+
+## Why the numbers drop at each stage
+
+The trusted layer is where consent filtering happens: `customer_landing` starts at 956 rows, but only 482 customers had actually agreed to share data for research, so `customer_trusted` and everything downstream is built from that smaller, consented population. `accelerometer_trusted` (40,981 rows) is the accelerometer stream joined against consented customers only. The final `machine_learning_curated` table (43,681 rows) joins curated customers, trusted accelerometer readings, and step trainer readings into the single table the step-detection model actually trains on.
 
 ## Repo layout
 
@@ -35,77 +55,22 @@ stedi/
     └── 09_machine_learning_curated_count_43681.jpg
 ```
 
-## 0. One-time setup
+## Running it
 
-1. Launch your AWS Cloud Lab, open the AWS Console, confirm you're in `us-east-1`.
-2. Create an S3 bucket (any globally-unique name, e.g. `stedi-<yourname>-lake`).
-3. Copy the source landing data from the course bucket into your own bucket:
+1. Provision an AWS environment (S3, Glue, Athena) in `us-east-1` and create an S3 bucket for the lake.
+2. Load the three source datasets (customer profiles, accelerometer readings, step trainer readings) into `landing/` prefixes in that bucket.
+3. Create an Athena database called `stedi`.
+4. Run each file in `sql/` in the Athena query editor to build the three landing tables.
+5. Run the Glue jobs in order: the two trusted-zone jobs, then the three curated-zone jobs.
 
-```bash
-aws s3 cp --recursive s3://cd0030bucket/customers/      s3://stedi-dandre-mcneish-lake/customer/landing/
-aws s3 cp --recursive s3://cd0030bucket/accelerometer/  s3://stedi-dandre-mcneish-lake/accelerometer/landing/
-aws s3 cp --recursive s3://cd0030bucket/step_trainer/   s3://stedi-dandre-mcneish-lake/step_trainer/landing/
-```
+All SQL/Python in this repo references the bucket used for this run (`stedi-dandre-mcneish-lake`); swap in your own bucket name if you're running it fresh.
 
-4. In Athena / Glue, create a database called `stedi` (Athena: `CREATE DATABASE stedi;`).
-5. All SQL/Python files in this repo already use the actual bucket
-   (`stedi-dandre-mcneish-lake`) that this run used.
+## A stricter variant
 
-## 1. Landing Zone — create the 3 tables (Athena)
+`stand_out/` holds two alternate versions of the trusted/curated jobs that go further: dropping any accelerometer reading recorded before the customer's consent date, and stripping email/user identifiers from the final ML table so it's fully anonymized. Row counts under that stricter version: `accelerometer_trusted` 32,025, `customers_curated` 464, `step_trainer_trusted` 14,460 (unchanged), `machine_learning_curated` 34,437. Not used for the run documented above, included for reference.
 
-Run each file in `sql/` in the Athena query editor, in any order:
+## Notes from building this
 
-- `customer_landing.sql` → **956 rows** (verified, see screenshots/01)
-- `accelerometer_landing.sql` → **81273 rows** (verified, see screenshots/02)
-- `step_trainer_landing.sql` → **28680 rows** (verified, see screenshots/03)
-
-Screenshot 04 shows `customer_landing` rows with a blank `sharewithresearchasofdate`.
-
-## 2. Trusted Zone — 2 Glue jobs, in this order
-
-1. `customer_landing_to_trusted.py` → `customer_trusted` = **482 rows** (screenshots/05)
-2. `accelerometer_landing_to_trusted.py` → `accelerometer_trusted` = **40981 rows** (screenshots/06)
-
-## 3. Curated Zone — 3 more Glue jobs, in this order
-
-1. `customer_trusted_to_curated.py` → `customers_curated` = **482 rows** (screenshots/07)
-2. `step_trainer_trusted.py` → `step_trainer_trusted` = **14460 rows**
-3. `machine_learning_curated.py` → `machine_learning_curated` = **43681 rows** (screenshots/09)
-
-(`step_trainer_trusted` count of 14460 was verified live in Athena; screenshot 08.)
-
-## 4. Row-count checklist — all verified against the rubric
-
-| Zone     | Table                     | Expected rows | Actual (verified) |
-|----------|---------------------------|---------------|--------------------|
-| Landing  | customer_landing          | 956           | 956 |
-| Landing  | accelerometer_landing     | 81273         | 81273 |
-| Landing  | step_trainer_landing      | 28680         | 28680 |
-| Trusted  | customer_trusted          | 482           | 482 |
-| Trusted  | accelerometer_trusted     | 40981         | 40981 |
-| Trusted  | step_trainer_trusted      | 14460         | 14460 |
-| Curated  | customers_curated         | 482           | 482 |
-| Curated  | machine_learning_curated  | 43681         | 43681 |
-
-## 5. Optional stand-out version
-
-Swap in the two scripts in `stand_out/` instead of their base equivalents
-(`accelerometer_landing_to_trusted.py` and `machine_learning_curated.py`) if
-you want to also: (a) drop any accelerometer reading recorded before the
-customer's consent date, and (b) strip email/user identifiers from the final
-ML table so it's fully anonymized. Expected row counts then become:
-accelerometer_trusted 32025, customers_curated 464, step_trainer_trusted
-14460 (unchanged), machine_learning_curated 34437. (Not used for this run —
-included for reference only.)
-
-## 6. Troubleshooting reminders (from the course)
-
-- **Access Denied running a Glue Job** → check the Glue IAM role's permissions
-  and trust relationship for S3 access.
-- **step_trainer_trusted returns 0 rows** → this is why `step_trainer_trusted.py`
-  uses `WHERE serialNumber IN (...)` instead of an `INNER JOIN` — serial
-  numbers are not unique, and Spark's join behaves differently from Presto/
-  Athena on non-unique join keys.
-- Whenever you edit and re-run a job: make sure the job is **saved** first,
-  then delete the old Athena table and old S3 output files before re-running,
-  or you'll see stale/duplicated data.
+- **Access Denied running a Glue job** almost always traces back to the Glue IAM role's permissions or trust relationship for S3 access, not the job code itself.
+- **`step_trainer_trusted` returning 0 rows** is why that job filters with `WHERE serialNumber IN (...)` instead of an `INNER JOIN`: serial numbers aren't unique in the source data, and Spark's join behaves differently from Presto/Athena on non-unique join keys, silently dropping rows a plain join would keep.
+- Re-running a job after edits requires deleting the old Athena table and old S3 output files first, or you'll see stale or duplicated data sitting alongside the new run.
